@@ -110,7 +110,7 @@ def buildImgsUrlList(driver, ANCHOR_TAGS_LIST):
     return IMG_SRC_LIST
 
 def doScraping():
-    ALBUM_URL = "https://www.facebook.com/media/set/?set=a.601862741947391&type=3"
+    ALBUM_URL = "https://www.facebook.com/some_albums_url"
     A_TAG_CLASS_NAME = "x1i10hfl xjbqb8w x6umtig x1b1mbwd xaqea5y xav7gou x9f619 x1ypdohk xt0psk2 xe8uvvx xdj266r x11i5rnm xat24cr x1mh8g0r xexx8yu x4uap5 x18d9i69 xkhd6sd x16tdsg8 x1hl2dhg xggy1nq x1a2a7pz x1heor9g xt0b8zv"
     ALBUMS_TITLE_CLASS_NAME = "xwoyzhm x1rhet7l"
 
