@@ -27,6 +27,6 @@ A Python script to download Facebook albums even if you're not the album's owner
      python3 albumDownloader.py
      ```
 
-**Note:** I've done this for educational purposes. Feel free to contribute or modify it to suit your needs.
+**Note:** I've done this for educational purposes (web scraping practice). Feel free to contribute or modify it to suit your needs.
 
 Happy album downloading :)!
