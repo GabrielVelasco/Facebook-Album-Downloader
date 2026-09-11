@@ -476,41 +476,100 @@ def find_photo_links(soup):
     return photo_links
 
 
+def is_avatar_url(url):
+    """
+    Check if a Facebook image URL is a profile picture or avatar thumbnail.
+    """
+    if not url:
+        return True
+    lower_url = url.lower()
+    # Facebook CDN uses -1 for profile pictures (e.g., t39.30808-1, t1.6435-1, t1.15752-1)
+    if '/t39.30808-1/' in lower_url or '/t1.6435-1/' in lower_url or '/t1.15752-1/' in lower_url or '-1/' in lower_url:
+        return True
+    # Common avatar thumbnail size parameters
+    avatar_patterns = [
+        's100x100', 'p100x100', 's50x50', 'p50x50', 's60x60', 'p60x60',
+        's160x160', 'p160x160', 's200x200', 'p200x200', 'dst-jpg_s', 'dst-jpg_p'
+    ]
+    if any(pattern in lower_url for pattern in avatar_patterns):
+        return True
+    return False
+
+
 def extract_high_res_image(driver, photo_url):
     """
     Navigate to a photo page and extract the high-resolution image URL.
-    Uses multiple strategies to find the image.
+    Uses multiple strategies to find the real album image and avoid profile avatars.
     """
     try:
         driver.get(photo_url)
-        time.sleep(1)
 
-        # Wait for page to load
-        WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
-            EC.presence_of_element_located((By.TAG_NAME, "img"))
-        )
+        # Wait for the photo viewer element to appear
+        try:
+            WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    "img[data-visualcompletion='media-vc-image'], div[role='dialog'] img, div[data-pagelet='MediaViewerRoot'] img"
+                ))
+            )
+        except Exception:
+            time.sleep(2)
 
+        # Strategy 1: Check specifically for Facebook's media viewer image
+        # Facebook tags the main full-screen photo with data-visualcompletion="media-vc-image"
+        main_img = driver.find_elements(By.CSS_SELECTOR, "img[data-visualcompletion='media-vc-image']")
+        if main_img:
+            src = main_img[0].get_attribute("src")
+            if src and "scontent" in src:
+                return src
+
+        # Strategy 2: Use JavaScript to find the largest image by natural dimensions
+        # Real album photos will have naturalWidth / naturalHeight > 300 (usually 1000-2048+),
+        # whereas avatars and icons are 100x100, 50x50, 40x40, etc.
+        js_find_largest = """
+            const imgs = Array.from(document.querySelectorAll('img'))
+                .filter(img => {
+                    if (!img.src || !img.src.includes('scontent')) return false;
+                    const s = img.src.toLowerCase();
+                    if (s.includes('-1/') || s.includes('_s100x100') || s.includes('_p100x100') ||
+                        s.includes('dst-jpg_s') || s.includes('dst-jpg_p')) {
+                        return false;
+                    }
+                    return img.naturalWidth > 300 && img.naturalHeight > 300;
+                });
+            if (imgs.length > 0) {
+                imgs.sort((a, b) => (b.naturalWidth * b.naturalHeight) - (a.naturalWidth * a.naturalHeight));
+                return imgs[0].src;
+            }
+            return null;
+        """
+        largest_src = driver.execute_script(js_find_largest)
+        if largest_src:
+            return largest_src
+
+        # Strategy 3: Check dialog / media viewer container
+        dialog_imgs = driver.find_elements(By.CSS_SELECTOR, "div[role='dialog'] img, div[data-pagelet*='Media'] img")
+        for img in dialog_imgs:
+            src = img.get_attribute("src")
+            if src and "scontent" in src and not is_avatar_url(src):
+                return src
+
+        # Strategy 4: Fallback BeautifulSoup parsing with strict avatar filtering
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-
-        # Strategy 1: Find the largest image by checking data-visualcompletion
-        # or specific class patterns used by Facebook for photo viewers
-        all_imgs = soup.find_all('img')
-
         candidate_images = []
-        for img in all_imgs:
+        for img in soup.find_all('img'):
             src = img.get('src', '')
-            # Skip small images, profile pics, and icons
-            if not src or 'emoji' in src.lower():
+            if not src or 'scontent' not in src or 'emoji' in src.lower():
                 continue
-            if 'scontent' in src:  # Facebook CDN images
-                candidate_images.append(src)
+            if is_avatar_url(src):
+                continue
+            candidate_images.append(src)
 
-        # Return the image URL that's likely the main photo
-        # Usually it's one of the larger images with scontent CDN
         if candidate_images:
-            # Prefer images with specific size indicators or the longest URL
-            # (high-res images typically have more parameters)
-            return max(candidate_images, key=len)
+            non_avatar = [u for u in candidate_images if '-1/' not in u]
+            if non_avatar:
+                return non_avatar[0]
+            return candidate_images[0]
 
         return None
 
@@ -519,32 +578,64 @@ def extract_high_res_image(driver, photo_url):
         return None
 
 
-def extract_album_title(soup):
+def extract_album_title(soup, album_url=None):
     """
     Extract the album title from the page using multiple strategies.
+    Avoids picking up navigation banners, notifications, or unrelated text.
     """
-    # Strategy 1: Look for common heading patterns
-    for tag in ['h1', 'h2', 'span', 'div']:
-        elements = soup.find_all(tag)
-        for elem in elements:
-            text = elem.get_text(strip=True)
-            # Album titles are usually short and don't contain URLs
-            if text and MIN_ALBUM_TITLE_LENGTH < len(text) < MAX_ALBUM_TITLE_LENGTH and 'http' not in text.lower():
-                lower_text = text.lower()
-                ignored_keywords = ['log in', 'sign up', 'facebook', 'menu', 'notification', 'create', 'search']
-                if not any(x in lower_text for x in ignored_keywords):
-                    return text
+    ignored_keywords = [
+        'log in', 'sign up', 'facebook', 'menu', 'notification', 'notifications',
+        'unread', 'approved a login', 'create', 'search', 'messages', 'messenger',
+        'home', 'friends', 'watch', 'marketplace', 'gaming', 'today', 'earlier', 'new'
+    ]
 
-    # Strategy 2: Use page title
+    def is_valid_title(text):
+        if not text or len(text) < 3 or len(text) > MAX_ALBUM_TITLE_LENGTH:
+            return False
+        if 'http' in text.lower():
+            return False
+        lower = text.lower()
+        if any(k in lower for k in ignored_keywords):
+            return False
+        return True
+
+    # Strategy 1: Check link matching the album set ID or album URL
+    if album_url:
+        set_match = re.search(r'set=([a-zA-Z0-9._]+)', album_url)
+        if set_match:
+            set_id = set_match.group(1)
+            for a in soup.find_all('a', href=True):
+                if set_id in a.get('href', ''):
+                    text = a.get_text(strip=True)
+                    if is_valid_title(text):
+                        return text
+
+    # Strategy 2: Look for heading elements (h1, h2, h3, [role="heading"])
+    for elem in soup.find_all(['h1', 'h2', 'h3']):
+        text = elem.get_text(strip=True)
+        if is_valid_title(text):
+            return text
+
+    for elem in soup.find_all(attrs={'role': 'heading'}):
+        text = elem.get_text(strip=True)
+        if is_valid_title(text):
+            return text
+
+    # Strategy 3: Use page title if it is clean
     title_tag = soup.find('title')
     if title_tag:
         title = title_tag.get_text(strip=True)
-        # Remove notification count like "(3) " and "Facebook" suffix
         title = re.sub(r'^\(\d+\)\s*', '', title)
         title = re.sub(r'\s*[-|]\s*Facebook.*$', '', title, flags=re.IGNORECASE)
         title = re.sub(r'^Facebook.*$', '', title, flags=re.IGNORECASE).strip()
-        if title:
+        if is_valid_title(title):
             return title
+
+    # Strategy 4: Fallback to album ID if available
+    if album_url:
+        set_match = re.search(r'set=([a-zA-Z0-9._]+)', album_url)
+        if set_match:
+            return f"Album_{set_match.group(1)}"
 
     return "Facebook_Album"
 
@@ -704,7 +795,7 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
         soup = BeautifulSoup(driver.page_source, 'html.parser')
 
         # Extract album title
-        album_title = extract_album_title(soup)
+        album_title = extract_album_title(soup, album_url=album_url)
         album_title = sanitize_filename(album_title)
         print(f"Album title: {album_title}")
 
