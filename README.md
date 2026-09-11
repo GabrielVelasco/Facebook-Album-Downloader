@@ -4,6 +4,8 @@ A Python script to download Facebook albums even if you're not the album's owner
 
 ## Features
 
+- **Interactive authentication** - Log in via the browser to access private or restricted albums
+- **Session persistence** - Saves cookies to disk for seamless reuse across downloads without re-logging in
 - **Command-line interface** - Pass the album URL directly as an argument
 - **Cross-platform support** - Works on Windows, macOS, and Linux
 - **Parallel downloads** - Downloads multiple images simultaneously for faster completion
@@ -61,11 +63,34 @@ python albumDownloader.py <album_url> --output <folder_name>
 python albumDownloader.py "https://www.facebook.com/media/set/?set=a.123456789" --output my_downloads
 ```
 
+### Authentication & Private Albums
+
+To download private or restricted albums that require you to be logged into Facebook, use the `--login` (or `--auth`) flag:
+
+```bash
+python albumDownloader.py <album_url> --login
+```
+
+This will:
+1. Open the Facebook login page in a visible Firefox window.
+2. Allow you to enter your credentials, complete 2FA, and solve any security prompts.
+3. Automatically detect when you are logged in (or you can press `Enter` in the console).
+4. Save your session cookies to `facebook_cookies.json` for subsequent downloads.
+
+You can also authenticate ahead of time without downloading an album:
+```bash
+python albumDownloader.py --login
+```
+
+Subsequent runs will automatically restore your saved session from `facebook_cookies.json`, allowing you to run even in `--headless` mode.
+
 ### Headless Mode (No Visible Browser)
 
 ```bash
 python albumDownloader.py <album_url> --headless
 ```
+
+> **Note:** If an album requires login and the session has expired, running in `--headless` mode will prompt you to re-authenticate with `--login`.
 
 ### Interactive Mode
 
@@ -81,10 +106,13 @@ python albumDownloader.py
 | `album_url` | URL of the Facebook album to download |
 | `-o, --output` | Output folder for downloaded images (default: `downloadedImgs`) |
 | `--headless` | Run browser in headless mode (no visible window) |
+| `--login`, `--auth` | Open Facebook login page in browser and wait for authentication |
+| `--cookies` | Path to save/load Facebook session cookies (default: `facebook_cookies.json`) |
+| `--no-cookies` | Disable loading or saving session cookies to disk |
 
 ## Limitations
 
-- **Public albums only** - The script can only download public albums. Private albums require authentication which is not supported.
+- **Account Access** - To download private albums, your authenticated account must have permission to view the album (e.g. friends-only or shared albums).
 - **Facebook UI changes** - Facebook frequently changes their website structure. The script uses multiple strategies to find images, but may need updates if Facebook makes major changes.
 - **Rate limiting** - Downloading too many albums in quick succession may trigger Facebook's rate limiting.
 
@@ -94,10 +122,9 @@ python albumDownloader.py
 - Make sure Firefox is installed
 - Make sure geckodriver is installed and in your PATH
 
-**"No photos found"**
-- The album may be private or require login
-- Facebook's page structure may have changed
-- Try running without `--headless` to see if there are any login prompts
+**"This album requires authentication to view" / "No photos found"**
+- The album may be private or friends-only. Run with `--login` to log into your Facebook account inside the browser.
+- If running in `--headless` mode, run without `--headless` and with `--login` to re-authenticate.
 
 **Downloads are slow**
 - Consider running with `--headless` mode for slightly faster operation
