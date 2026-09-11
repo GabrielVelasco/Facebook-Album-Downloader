@@ -29,6 +29,7 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -38,7 +39,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 DEFAULT_OUTPUT_FOLDER = "downloadedImgs"
 DEFAULT_COOKIE_FILE = "facebook_cookies.json"
 MAX_WORKERS = 5  # Number of concurrent downloads
-SCROLL_PAUSE_TIME = 1.5
+SCROLL_PAUSE_TIME = 2.0
+DEFAULT_MAX_SCROLLS = 300
 PAGE_LOAD_TIMEOUT = 10
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
@@ -411,37 +413,122 @@ def download_images_parallel(img_urls, output_path, cookies=None):
     return successful, failed
 
 
-def scroll_to_load_all(driver, max_scroll_attempts=50):
+def scroll_and_collect_photos(driver, max_scroll_attempts=DEFAULT_MAX_SCROLLS, scroll_pause_time=SCROLL_PAUSE_TIME):
     """
-    Scroll down to load all photos in the album.
-    Uses a more reliable scrolling approach with maximum attempts.
+    Scroll down the album container and page, progressively accumulating photo links.
+    Handles modern Facebook's internal scrollable containers, DOM recycling/virtualization,
+    and provides real-time progress updates.
     """
-    print("Loading all photos in album...")
+    print("Scanning and loading all photos in album...")
 
-    last_height = driver.execute_script("return document.body.scrollHeight")
-    scroll_attempts = 0
+    photo_links = []
+    seen_links = set()
+
+    def collect_from_dom():
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        new_count = 0
+        for href in find_photo_links(soup):
+            if href not in seen_links:
+                seen_links.add(href)
+                photo_links.append(href)
+                new_count += 1
+        return new_count
+
+    # Collect initial links before scrolling
+    initial_count = collect_from_dom()
+    print(f"  Initially detected: {initial_count} photo(s)")
+
     no_change_count = 0
+    scroll_attempts = 0
 
     while scroll_attempts < max_scroll_attempts:
-        # Scroll down
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(SCROLL_PAUSE_TIME)
-
-        # Check for new content
-        new_height = driver.execute_script("return document.body.scrollHeight")
-
-        if new_height == last_height:
-            no_change_count += 1
-            # If no change for 3 consecutive checks, assume we've loaded everything
-            if no_change_count >= 3:
-                break
-        else:
-            no_change_count = 0
-
-        last_height = new_height
         scroll_attempts += 1
+        prev_total = len(photo_links)
 
-    print(f"Scrolling complete after {scroll_attempts} scroll(s)")
+        # 1. Scroll any internal scrollable containers (Facebook Comshell / React container divs)
+        # 2. Also scroll window / documentElement
+        driver.execute_script("""
+            const all = document.querySelectorAll('*');
+            for (let el of all) {
+                const style = window.getComputedStyle(el);
+                if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
+                    el.scrollTop = el.scrollHeight;
+                    el.dispatchEvent(new Event('scroll', { bubbles: true }));
+                }
+            }
+            window.scrollTo(0, document.documentElement.scrollHeight || document.body.scrollHeight);
+            window.dispatchEvent(new Event('scroll'));
+        """)
+
+        # 3. Send END key to body to trigger Facebook's keyboard-based infinite scrolling
+        try:
+            body = driver.find_element(By.TAG_NAME, "body")
+            body.send_keys(Keys.END)
+        except Exception:
+            pass
+
+        # 4. Wait for potential loading spinner / network activity
+        time.sleep(scroll_pause_time)
+
+        # Check if Facebook is showing a loading spinner
+        try:
+            loading_indicators = driver.find_elements(By.CSS_SELECTOR, "[role='progressbar'], [aria-busy='true']")
+            if loading_indicators:
+                time.sleep(1.0)
+        except Exception:
+            pass
+
+        # 5. Collect newly loaded photo links
+        new_items = collect_from_dom()
+
+        if new_items > 0:
+            print(f"  Loading photos... Found {len(photo_links)} photos so far...", end='\r')
+            no_change_count = 0
+        else:
+            no_change_count += 1
+            # Nudge scroll up slightly then down again to re-trigger intersection observers if stuck
+            try:
+                driver.execute_script("""
+                    const all = document.querySelectorAll('*');
+                    for (let el of all) {
+                        const style = window.getComputedStyle(el);
+                        if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
+                            el.scrollTop = Math.max(0, el.scrollTop - 200);
+                        }
+                    }
+                """)
+                time.sleep(0.5)
+                driver.execute_script("""
+                    const all = document.querySelectorAll('*');
+                    for (let el of all) {
+                        const style = window.getComputedStyle(el);
+                        if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
+                            el.scrollTop = el.scrollHeight;
+                            el.dispatchEvent(new Event('scroll', { bubbles: true }));
+                        }
+                    }
+                """)
+                time.sleep(scroll_pause_time)
+                collect_from_dom()
+            except Exception:
+                pass
+
+            if len(photo_links) > prev_total:
+                print(f"  Loading photos... Found {len(photo_links)} photos so far...", end='\r')
+                no_change_count = 0
+            elif no_change_count >= 4:
+                # No new photos after 4 consecutive attempts
+                break
+
+    print(f"\nScanning complete: Found {len(photo_links)} photo(s) across {scroll_attempts} scroll(s)")
+    return photo_links
+
+
+def scroll_to_load_all(driver, max_scroll_attempts=DEFAULT_MAX_SCROLLS):
+    """
+    Scroll down to load all photos in the album (legacy compatibility wrapper).
+    """
+    return scroll_and_collect_photos(driver, max_scroll_attempts=max_scroll_attempts)
 
 
 def find_photo_links(soup):
@@ -451,27 +538,17 @@ def find_photo_links(soup):
     """
     photo_links = []
 
-    # Strategy 1: Find links that point to photo pages (contain /photo/)
     for link in soup.find_all('a', href=True):
         href = link.get('href', '')
-        if '/photo/' in href or '/photos/' in href:
+        # Strategy 1: Find links that point to photo pages (contain /photo/ or /photos/)
+        # Strategy 2: Find links with photo thumbnail inside containing fbid=
+        if '/photo/' in href or '/photos/' in href or (link.find('img') and 'fbid=' in href):
             if href.startswith('/'):
                 href = f"https://www.facebook.com{href}"
             elif not href.startswith('http'):
                 continue
             if href not in photo_links:
                 photo_links.append(href)
-
-    # Strategy 2: Find links with photo-related data attributes
-    if not photo_links:
-        for link in soup.find_all('a', href=True):
-            href = link.get('href', '')
-            # Look for links with image thumbnails inside
-            if link.find('img') and 'fbid=' in href:
-                if href.startswith('/'):
-                    href = f"https://www.facebook.com{href}"
-                if href not in photo_links:
-                    photo_links.append(href)
 
     return photo_links
 
@@ -680,7 +757,8 @@ def validate_url(url):
 
 
 def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=False,
-                login=False, cookie_file=DEFAULT_COOKIE_FILE, save_cookies_flag=True):
+                login=False, cookie_file=DEFAULT_COOKIE_FILE, save_cookies_flag=True,
+                max_scrolls=DEFAULT_MAX_SCROLLS, scroll_delay=SCROLL_PAUSE_TIME):
     """
     Main scraping function with authentication and improved error handling.
     """
@@ -788,21 +866,19 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
             driver.get(album_url)
             time.sleep(3)
 
-        # Scroll to load all photos
-        scroll_to_load_all(driver)
-
-        # Parse the page
+        # Parse initial page and extract album title
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-
-        # Extract album title
         album_title = extract_album_title(soup, album_url=album_url)
         album_title = sanitize_filename(album_title)
         print(f"Album title: {album_title}")
 
-        # Find photo links
-        print("Finding photo links...")
-        photo_links = find_photo_links(soup)
-        print(f"Found {len(photo_links)} photo links")
+        # Scroll to load all photos and collect links progressively
+        photo_links = scroll_and_collect_photos(
+            driver,
+            max_scroll_attempts=max_scrolls,
+            scroll_pause_time=scroll_delay
+        )
+        print(f"Total photo links detected: {len(photo_links)}")
 
         if not photo_links:
             print("No photos found. The page structure may have changed or the album may be private/inaccessible.")
@@ -895,6 +971,20 @@ def main():
         help='Do not save or load session cookies from disk'
     )
 
+    parser.add_argument(
+        '--max-scrolls',
+        type=int,
+        default=DEFAULT_MAX_SCROLLS,
+        help=f'Maximum scroll attempts for loading photos (default: {DEFAULT_MAX_SCROLLS})'
+    )
+
+    parser.add_argument(
+        '--scroll-delay',
+        type=float,
+        default=SCROLL_PAUSE_TIME,
+        help=f'Delay in seconds between scroll actions (default: {SCROLL_PAUSE_TIME})'
+    )
+
     args = parser.parse_args()
 
     # If no URL provided, prompt for it or handle login-only
@@ -921,7 +1011,9 @@ def main():
         headless=args.headless,
         login=args.login,
         cookie_file=args.cookies,
-        save_cookies_flag=not args.no_cookies
+        save_cookies_flag=not args.no_cookies,
+        max_scrolls=args.max_scrolls,
+        scroll_delay=args.scroll_delay
     )
 
     if success:
