@@ -50,3 +50,8 @@ coverage.xml
 docs/_build/
 sampleTest.html
 downloadedImgs
+
+# Session and cookie files
+*cookies.json
+.fb_cookies.json
+facebook_cookies.json
