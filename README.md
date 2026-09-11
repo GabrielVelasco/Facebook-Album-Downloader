@@ -6,7 +6,11 @@ A Python script to download Facebook albums even if you're not the album's owner
 
 - **Interactive authentication** - Log in via the browser to access private or restricted albums
 - **Session persistence** - Saves cookies to disk for seamless reuse across downloads without re-logging in
-- **Command-line interface** - Pass the album URL directly as an argument
+- **Resumable downloads & URL caching** - Saves extracted image URLs (both Facebook photo URL and direct download URL) to disk and detects already saved files on disk
+- **Progressive saving** - Automatically persists URLs to disk after each photo is extracted, preventing lost progress on interruption (Ctrl+C, network timeout)
+- **Direct manifest resumption** - Resume downloads directly from a saved `album_urls.json` manifest file without reopening Facebook
+- **Automatic token refresh** - Automatically detects expired Facebook CDN tokens (HTTP 403) and refreshes direct URLs via the browser
+- **Command-line interface** - Pass the album URL or saved manifest directly as an argument
 - **Cross-platform support** - Works on Windows, macOS, and Linux
 - **Parallel downloads** - Downloads multiple images simultaneously for faster completion
 - **Automatic retry** - Retries failed downloads up to 3 times
@@ -50,6 +54,53 @@ python albumDownloader.py <album_url>
 **Example:**
 ```bash
 python albumDownloader.py "https://www.facebook.com/media/set/?set=a.796525246431139&type=3"
+```
+
+### Resuming an Interrupted Download
+
+The script is automatically **resumable**. Extracted photo URLs (both the Facebook URL and the direct CDN download URL) are progressively saved to `album_urls.json` in the album's folder.
+
+If a download is interrupted or stopped:
+1. **Simply rerun the same command:**
+   ```bash
+   python albumDownloader.py "https://www.facebook.com/media/set/?set=a.796525246431139&type=3"
+   ```
+   The script detects `album_urls.json` and already downloaded images on disk:
+   - Skips re-navigating to photo pages for already extracted URLs
+   - Skips re-downloading files that are already present on disk with valid size
+   - Only processes remaining photos and missing files
+
+2. **Or resume directly from the saved URLs file:**
+   ```bash
+   python albumDownloader.py downloadedImgs/My_Album/album_urls.json
+   ```
+   This resumes the download directly using the saved URLs without needing to re-open or re-scroll Facebook.
+
+### Extracting URLs Only (No Download)
+
+To extract and save all photo URLs without downloading the image files:
+```bash
+python albumDownloader.py <album_url> --urls-only
+```
+
+This generates `album_urls.json` containing:
+```json
+{
+  "album_url": "https://www.facebook.com/media/set/?set=...",
+  "album_title": "My Album",
+  "total_photos": 45,
+  "extracted_count": 45,
+  "downloaded_count": 45,
+  "photos": [
+    {
+      "index": 1,
+      "facebook_url": "https://www.facebook.com/photo/?fbid=...",
+      "direct_url": "https://scontent-iad3-1.xx.fbcdn.net/v/...",
+      "filename": "1.jpg",
+      "downloaded": true
+    }
+  ]
+}
 ```
 
 ### With Custom Output Folder
@@ -103,8 +154,11 @@ python albumDownloader.py
 
 | Option | Description |
 |--------|-------------|
-| `album_url` | URL of the Facebook album to download |
+| `album_url` | URL of the Facebook album or path to a saved `album_urls.json` file |
 | `-o, --output` | Output folder for downloaded images (default: `downloadedImgs`) |
+| `--urls-file` | Custom file path to save/load extracted photo URLs (default: `<album_folder>/album_urls.json`) |
+| `--no-resume` | Disable resumption; force re-extracting all URLs and re-downloading files |
+| `--urls-only` | Extract and save image URLs to disk without downloading images |
 | `--headless` | Run browser in headless mode (no visible window) |
 | `--login`, `--auth` | Open Facebook login page in browser and wait for authentication |
 | `--cookies` | Path to save/load Facebook session cookies (default: `facebook_cookies.json`) |

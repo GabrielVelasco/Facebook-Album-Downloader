@@ -38,6 +38,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 # Configuration
 DEFAULT_OUTPUT_FOLDER = "downloadedImgs"
 DEFAULT_COOKIE_FILE = "facebook_cookies.json"
+DEFAULT_URLS_FILENAME = "album_urls.json"
+ALT_URLS_FILENAME = "photo_urls.json"
 MAX_WORKERS = 5  # Number of concurrent downloads
 SCROLL_PAUSE_TIME = 2.0
 DEFAULT_MAX_SCROLLS = 300
@@ -48,6 +50,7 @@ REQUEST_TIMEOUT = 30
 LOGIN_TIMEOUT = 300  # Max wait time for interactive login (5 minutes)
 MIN_ALBUM_TITLE_LENGTH = 10
 MAX_ALBUM_TITLE_LENGTH = 100
+
 
 
 def safe_get(driver, url):
@@ -325,13 +328,423 @@ def create_folder(main_folder, album_title):
     return full_path
 
 
+
+def normalize_photo_id(url):
+    """
+    Extract a canonical identifier for a Facebook photo URL.
+    Handles various Facebook photo URL formats:
+      - /photo/?fbid=123456789...
+      - /photo.php?fbid=123456789...
+      - /username/photos/a.123/456789/
+      - /photos/pcb.123/456789/
+    Falls back to cleaned URL without session/ephemeral query strings.
+    """
+    if not url:
+        return ""
+    # Check for fbid query parameter
+    match = re.search(r'[?&]fbid=(\d+)', url)
+    if match:
+        return f"fbid_{match.group(1)}"
+
+    # Check for /photos/[...]/(\d+)
+    match = re.search(r'/photos/(?:[^/]+/)?(\d+)', url)
+    if match:
+        return f"photo_{match.group(1)}"
+
+    # Check for pcb.(\d+)
+    match = re.search(r'pcb\.(\d+)', url)
+    if match:
+        return f"pcb_{match.group(1)}"
+
+    # Fallback to normalized URL without query strings
+    parsed = urlparse(url)
+    clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip('/')
+    return clean_url.lower() if clean_url else url.strip().lower()
+
+
+def get_manifest_path(output_path, custom_path=None):
+    """
+    Determine the path to the saved URLs manifest file.
+    If custom_path is given, returns that path.
+    Otherwise checks if album_urls.json or photo_urls.json exists in output_path,
+    defaulting to DEFAULT_URLS_FILENAME (album_urls.json).
+    """
+    if custom_path:
+        return custom_path
+    if not output_path:
+        return DEFAULT_URLS_FILENAME
+
+    candidate_album = os.path.join(output_path, DEFAULT_URLS_FILENAME)
+    candidate_photo = os.path.join(output_path, ALT_URLS_FILENAME)
+
+    if os.path.exists(candidate_album):
+        return candidate_album
+    if os.path.exists(candidate_photo):
+        return candidate_photo
+
+    return candidate_album
+
+
+def load_saved_urls(file_path):
+    """
+    Load saved photo URLs from a JSON file on disk.
+    Supports:
+      1. Standard manifest schema:
+         {"album_url": "...", "album_title": "...", "photos": [...]}
+      2. List schema:
+         [{"facebook_url": "...", "direct_url": "..."}, ...]
+      3. Dictionary mapping schema:
+         {"https://facebook.com/...": "https://scontent..."}
+    Returns a standardized dictionary with keys:
+      'album_url', 'album_title', 'photos'
+    or None if the file does not exist or is invalid.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return None
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            if "photos" in data and isinstance(data["photos"], list):
+                # Standard manifest schema
+                photos = []
+                for i, item in enumerate(data["photos"]):
+                    if isinstance(item, dict):
+                        p = {
+                            "index": item.get("index", i + 1),
+                            "facebook_url": item.get("facebook_url", item.get("fb_url", "")),
+                            "direct_url": item.get("direct_url", item.get("url", item.get("img_url", ""))),
+                            "filename": item.get("filename", ""),
+                            "downloaded": bool(item.get("downloaded", False)),
+                        }
+                        if "extracted_at" in item:
+                            p["extracted_at"] = item["extracted_at"]
+                        photos.append(p)
+                return {
+                    "album_url": data.get("album_url", ""),
+                    "album_title": data.get("album_title", ""),
+                    "photos": photos,
+                }
+            else:
+                # Key-value mapping: facebook_url -> direct_url
+                photos = []
+                for i, (fb_url, direct_url) in enumerate(data.items()):
+                    if fb_url in ["album_url", "album_title", "total_photos", "extracted_count", "downloaded_count", "updated_at"]:
+                        continue
+                    photos.append({
+                        "index": i + 1,
+                        "facebook_url": fb_url,
+                        "direct_url": direct_url if isinstance(direct_url, str) else "",
+                        "filename": f"{i + 1}.jpg",
+                        "downloaded": False,
+                    })
+                return {
+                    "album_url": data.get("album_url", ""),
+                    "album_title": data.get("album_title", ""),
+                    "photos": photos,
+                }
+
+        elif isinstance(data, list):
+            # List of photo objects or URL strings
+            photos = []
+            for i, item in enumerate(data):
+                if isinstance(item, dict):
+                    photos.append({
+                        "index": item.get("index", i + 1),
+                        "facebook_url": item.get("facebook_url", item.get("fb_url", "")),
+                        "direct_url": item.get("direct_url", item.get("url", item.get("img_url", ""))),
+                        "filename": item.get("filename", ""),
+                        "downloaded": bool(item.get("downloaded", False)),
+                    })
+                elif isinstance(item, str):
+                    photos.append({
+                        "index": i + 1,
+                        "facebook_url": "",
+                        "direct_url": item,
+                        "filename": f"{i + 1}.jpg",
+                        "downloaded": False,
+                    })
+            return {
+                "album_url": "",
+                "album_title": "",
+                "photos": photos,
+            }
+
+        return None
+
+    except Exception as e:
+        print(f"Warning: Could not read saved URLs file from {file_path}: {e}")
+        return None
+
+
+def save_urls_manifest(file_path, album_url, album_title, photos):
+    """
+    Save the photos manifest to disk atomically in JSON format.
+    Uses a temporary file before renaming to prevent corrupted data on unexpected termination.
+    """
+    if not file_path:
+        return False
+
+    folder = os.path.dirname(os.path.abspath(file_path))
+    if folder and not os.path.exists(folder):
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception:
+            pass
+
+    manifest_data = {
+        "album_url": album_url or "",
+        "album_title": album_title or "",
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "total_photos": len(photos),
+        "extracted_count": sum(1 for p in photos if p.get("direct_url")),
+        "downloaded_count": sum(1 for p in photos if p.get("downloaded")),
+        "photos": photos,
+    }
+
+    temp_path = f"{file_path}.tmp_{os.getpid()}"
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest_data, f, indent=2, ensure_ascii=False)
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+        os.replace(temp_path, file_path)
+        return True
+    except Exception as e:
+        print(f"Warning: Failed to save URLs manifest to {file_path}: {e}")
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        return False
+
+
+def detect_downloaded_images(photos, output_path):
+    """
+    Inspect the output directory on disk to check which photos have already been saved.
+    Updates each photo's 'downloaded' and 'filename' fields in-place.
+    Returns (downloaded_count, pending_count).
+    """
+    if not photos:
+        return 0, 0
+
+    if not os.path.exists(output_path):
+        for p in photos:
+            p["downloaded"] = False
+        return 0, len(photos)
+
+    valid_extensions = ['jpg', 'jpeg', 'png', 'webp', 'gif']
+    downloaded_count = 0
+
+    for p in photos:
+        idx = p.get("index", 1)
+        found = False
+        found_filename = None
+
+        # 1. Check existing recorded filename
+        if p.get("filename"):
+            candidate_path = os.path.join(output_path, p["filename"])
+            if os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 0:
+                found = True
+                found_filename = p["filename"]
+
+        # 2. Check candidate filenames: {idx}.{ext}
+        if not found:
+            for ext in valid_extensions:
+                candidate_name = f"{idx}.{ext}"
+                candidate_path = os.path.join(output_path, candidate_name)
+                if os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 0:
+                    found = True
+                    found_filename = candidate_name
+                    break
+
+        if found:
+            p["downloaded"] = True
+            p["filename"] = found_filename
+            downloaded_count += 1
+        else:
+            p["downloaded"] = False
+
+    pending_count = len(photos) - downloaded_count
+    return downloaded_count, pending_count
+
+
+def find_existing_manifest(output_folder, album_url=None, album_title=None):
+    """
+    Check if a saved URLs manifest already exists on disk in the output folder.
+    Matches by album_title folder name or by matching album_url / set ID in saved manifests.
+    Returns (album_dir_path, manifest_path, manifest_data) or (None, None, None).
+    """
+    if not output_folder or not os.path.exists(output_folder):
+        return None, None, None
+
+    candidate_filenames = [DEFAULT_URLS_FILENAME, ALT_URLS_FILENAME]
+
+    # 1. Check direct album_title folder variations if provided
+    if album_title:
+        clean_title = sanitize_filename(album_title)
+        dir_candidates = [
+            clean_title,
+            clean_title.replace(' ', '_'),
+            clean_title.replace(' ', '-'),
+            clean_title.replace('_', ' ')
+        ]
+        for dir_name in dir_candidates:
+            target_dir = os.path.join(output_folder, dir_name)
+            if os.path.exists(target_dir):
+                for fname in candidate_filenames:
+                    mpath = os.path.join(target_dir, fname)
+                    if os.path.exists(mpath):
+                        data = load_saved_urls(mpath)
+                        if data:
+                            return target_dir, mpath, data
+
+    # 2. Search all subdirectories in output_folder for matching album_url, set ID, or title in manifest
+    set_id = None
+    if album_url:
+        set_match = re.search(r'set=([a-zA-Z0-9._]+)', album_url)
+        set_id = set_match.group(1) if set_match else None
+
+    norm_title = album_title.strip().lower() if album_title else None
+
+    try:
+        with os.scandir(output_folder) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    for fname in candidate_filenames:
+                        mpath = os.path.join(entry.path, fname)
+                        if os.path.exists(mpath):
+                            data = load_saved_urls(mpath)
+                            if not data:
+                                continue
+                            saved_url = data.get("album_url", "")
+                            saved_title = data.get("album_title", "").strip().lower()
+
+                            # Match by URL or set ID
+                            if album_url and saved_url and (saved_url == album_url or (set_id and set_id in saved_url)):
+                                return entry.path, mpath, data
+
+                            # Match by title stored in manifest
+                            if norm_title and saved_title and (saved_title == norm_title or saved_title.replace(' ', '_') == norm_title.replace(' ', '_')):
+                                return entry.path, mpath, data
+    except Exception:
+        pass
+
+    return None, None, None
+
+
+def sync_photos_with_manifest(photo_links, saved_photos):
+    """
+    Merge newly scraped Facebook photo links with previously saved photos from disk.
+    Preserves existing direct URLs, downloaded status, and filenames for matching photos.
+    Assigns sequential indices to new photos.
+    Returns a unified list of photo dictionaries.
+    """
+    photos = []
+    seen_ids = set()
+
+    # Index saved photos by normalized ID
+    saved_by_id = {}
+    if saved_photos:
+        for p in saved_photos:
+            fb_url = p.get("facebook_url", "")
+            if fb_url:
+                nid = normalize_photo_id(fb_url)
+                if nid:
+                    saved_by_id[nid] = p
+
+    current_index = 1
+
+    # First, process scraped links in order
+    for link in photo_links:
+        nid = normalize_photo_id(link)
+        if nid in seen_ids:
+            continue
+        seen_ids.add(nid)
+
+        if nid in saved_by_id:
+            # Re-use existing saved record
+            existing = saved_by_id[nid]
+            photos.append({
+                "index": current_index,
+                "facebook_url": link,
+                "direct_url": existing.get("direct_url", ""),
+                "filename": existing.get("filename", f"{current_index}.jpg"),
+                "downloaded": bool(existing.get("downloaded", False)),
+                "extracted_at": existing.get("extracted_at", "")
+            })
+        else:
+            # New photo link
+            photos.append({
+                "index": current_index,
+                "facebook_url": link,
+                "direct_url": "",
+                "filename": f"{current_index}.jpg",
+                "downloaded": False,
+                "extracted_at": ""
+            })
+        current_index += 1
+
+    # Keep any previously saved photos that might not have appeared in current scroll
+    if saved_photos:
+        for p in saved_photos:
+            fb_url = p.get("facebook_url", "")
+            nid = normalize_photo_id(fb_url) if fb_url else None
+            if nid and nid not in seen_ids:
+                seen_ids.add(nid)
+                photos.append({
+                    "index": current_index,
+                    "facebook_url": fb_url,
+                    "direct_url": p.get("direct_url", ""),
+                    "filename": p.get("filename", f"{current_index}.jpg"),
+                    "downloaded": bool(p.get("downloaded", False)),
+                    "extracted_at": p.get("extracted_at", "")
+                })
+                current_index += 1
+
+    return photos
+
+
 def download_single_image(args):
     """
-    Download a single image with retry logic.
-    Args is a tuple of (index, img_url, output_path, session).
-    Returns a tuple of (index, success, message).
+    Download a single image with retry logic and disk detection.
+    Args can be:
+        (index, img_url, output_path, session)
+        or (index, img_url, output_path, session, known_filename, resume)
+    Returns:
+        (index, success, message, filename, is_skipped)
     """
-    index, img_url, output_path, session = args
+    if len(args) >= 6:
+        index, img_url, output_path, session, known_filename, resume = args[:6]
+    elif len(args) == 5:
+        index, img_url, output_path, session, known_filename = args
+        resume = True
+    else:
+        index, img_url, output_path, session = args
+        known_filename = None
+        resume = True
+
+    # 1. Disk detection: check if image is already saved on disk
+    if resume:
+        if known_filename:
+            target_path = os.path.join(output_path, known_filename)
+            if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                return (index, True, f"Already downloaded: {known_filename} (skipped)", known_filename, True)
+
+        for candidate_ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
+            candidate_name = f"{index + 1}.{candidate_ext}"
+            candidate_path = os.path.join(output_path, candidate_name)
+            if os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 0:
+                return (index, True, f"Already downloaded: {candidate_name} (skipped)", candidate_name, True)
+
+    if not img_url:
+        return (index, False, f"Failed to download image {index + 1}: No direct download URL available", None, False)
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -339,7 +752,7 @@ def download_single_image(args):
 
             if response.status_code == 200:
                 # Determine file extension from content-type or URL
-                content_type = response.headers.get('content-type', '')
+                content_type = response.headers.get('content-type', '').lower()
                 if 'jpeg' in content_type or 'jpg' in content_type:
                     ext = 'jpg'
                 elif 'png' in content_type:
@@ -348,42 +761,80 @@ def download_single_image(args):
                     ext = 'gif'
                 elif 'webp' in content_type:
                     ext = 'webp'
+                elif known_filename and '.' in known_filename:
+                    ext = known_filename.rsplit('.', 1)[-1]
                 else:
                     ext = 'jpg'  # Default to jpg
 
-                filename = f"{index + 1}.{ext}"
+                filename = known_filename if known_filename else f"{index + 1}.{ext}"
                 file_path = os.path.join(output_path, filename)
+                temp_file_path = f"{file_path}.tmp_{index}_{os.getpid()}"
 
-                with open(file_path, 'wb') as f:
+                with open(temp_file_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
 
-                return (index, True, f"Downloaded: {filename}")
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+                os.replace(temp_file_path, file_path)
+
+                return (index, True, f"Downloaded: {filename}", filename, False)
+            elif response.status_code in [403, 404, 410]:
+                return (index, False, f"Failed to download image {index + 1}: HTTP {response.status_code} (URL expired or inaccessible)", None, False)
             else:
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(1)
                     continue
-                return (index, False, f"Failed to download image {index + 1}: HTTP {response.status_code}")
+                return (index, False, f"Failed to download image {index + 1}: HTTP {response.status_code}", None, False)
 
         except requests.exceptions.RequestException as e:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(1)
                 continue
-            return (index, False, f"Failed to download image {index + 1}: {str(e)}")
+            return (index, False, f"Failed to download image {index + 1}: {str(e)}", None, False)
 
-    return (index, False, f"Failed to download image {index + 1} after {MAX_RETRIES} attempts")
+    return (index, False, f"Failed to download image {index + 1} after {MAX_RETRIES} attempts", None, False)
 
 
-def download_images_parallel(img_urls, output_path, cookies=None):
+def download_images_parallel(photo_items, output_path, cookies=None, driver=None,
+                             manifest_path=None, album_url=None, album_title=None,
+                             resume=True):
     """
     Download all images in parallel using ThreadPoolExecutor.
-    Shows progress as images are downloaded.
+    Supports resuming by detecting already downloaded files on disk.
+    Accepts either a list of URL strings or a list of photo dictionaries.
+    Refreshes expired direct download URLs via driver if available.
     """
-    total = len(img_urls)
-    successful = 0
-    failed = 0
+    if not photo_items:
+        print("No images to download.")
+        return 0, 0
 
-    print(f"\nDownloading {total} images to: {output_path}")
+    # Normalize photo_items into structured records
+    photos = []
+    for i, item in enumerate(photo_items):
+        if isinstance(item, dict):
+            photos.append(dict(item))
+        else:
+            photos.append({
+                "index": i + 1,
+                "facebook_url": "",
+                "direct_url": str(item),
+                "filename": f"{i + 1}.jpg",
+                "downloaded": False
+            })
+
+    total = len(photos)
+
+    # Disk detection before downloading
+    if resume:
+        downloaded_on_disk, pending_count = detect_downloaded_images(photos, output_path)
+        if downloaded_on_disk > 0:
+            print(f"[+] Detected {downloaded_on_disk} already downloaded image(s) on disk. {pending_count} to download.")
+
+    print(f"\nDownloading images to: {output_path}")
     print("-" * 50)
 
     # Create a session for connection pooling
@@ -403,10 +854,22 @@ def download_images_parallel(img_urls, output_path, cookies=None):
             )
 
     # Prepare arguments for parallel download
-    download_args = [
-        (i, url, output_path, session)
-        for i, url in enumerate(img_urls)
-    ]
+    download_args = []
+    for i, p in enumerate(photos):
+        idx = p.get("index", i + 1) - 1
+        download_args.append((
+            idx,
+            p.get("direct_url", ""),
+            output_path,
+            session,
+            p.get("filename", ""),
+            resume
+        ))
+
+    successful = 0
+    failed = 0
+    skipped = 0
+    expired_items = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
@@ -415,18 +878,68 @@ def download_images_parallel(img_urls, output_path, cookies=None):
         }
 
         for future in as_completed(futures):
-            index, success, message = future.result()
+            res = future.result()
+            idx, success, message = res[0], res[1], res[2]
+            filename = res[3] if len(res) > 3 else None
+            is_skipped = res[4] if len(res) > 4 else False
+
             if success:
                 successful += 1
+                if is_skipped:
+                    skipped += 1
+                photos[idx]["downloaded"] = True
+                if filename:
+                    photos[idx]["filename"] = filename
                 print(f"[{successful + failed}/{total}] {message}")
             else:
+                # Check if failure was due to expired/inaccessible CDN URL
+                if ("HTTP 403" in message or "HTTP 410" in message or "expired" in message.lower()) and photos[idx].get("facebook_url") and driver:
+                    expired_items.append((idx, photos[idx]))
+                else:
+                    failed += 1
+                    print(f"[{successful + failed}/{total}] {message}")
+
+    # Handle expired URLs if driver is available
+    if expired_items and driver:
+        print(f"\n[!] Refreshing {len(expired_items)} expired direct URL(s) via browser...")
+        for idx, p in expired_items:
+            fb_url = p.get("facebook_url")
+            print(f"  Refreshing URL for image {idx + 1} ({fb_url})...")
+            fresh_url = extract_high_res_image(driver, fb_url, timeout=PAGE_LOAD_TIMEOUT)
+            if fresh_url:
+                p["direct_url"] = fresh_url
+                print(f"  [+] Refreshed image {idx + 1}. Retrying download...")
+                retry_res = download_single_image((
+                    idx,
+                    fresh_url,
+                    output_path,
+                    session,
+                    p.get("filename", ""),
+                    False
+                ))
+                if retry_res[1]:
+                    successful += 1
+                    p["downloaded"] = True
+                    if retry_res[3]:
+                        p["filename"] = retry_res[3]
+                    print(f"  [+] Successfully downloaded refreshed image {idx + 1}")
+                else:
+                    failed += 1
+                    print(f"  [-] Retry failed for image {idx + 1}: {retry_res[2]}")
+            else:
                 failed += 1
-                print(f"[{successful + failed}/{total}] {message}")
+                print(f"  [-] Could not refresh direct URL for image {idx + 1}")
 
     session.close()
+
+    # Persist updated manifest with download states
+    if manifest_path:
+        save_urls_manifest(manifest_path, album_url, album_title, photos)
+
     print("-" * 50)
-    print(f"Download complete: {successful} successful, {failed} failed")
+    print(f"Download summary: {successful} completed ({skipped} already on disk, {successful - skipped} downloaded), {failed} failed")
     return successful, failed
+
 
 
 def scroll_and_collect_photos(driver, max_scroll_attempts=DEFAULT_MAX_SCROLLS, scroll_pause_time=SCROLL_PAUSE_TIME):
@@ -778,12 +1291,21 @@ def create_driver(headless=False, page_load_timeout=DEFAULT_PAGE_TIMEOUT):
 
 def validate_url(url):
     """
-    Validate that the URL is a valid Facebook album URL.
+    Validate that the URL is a valid Facebook album URL or saved URLs JSON file.
     """
+    if not url:
+        return False, "No URL or file provided"
+
+    # Check if input is an existing local manifest JSON file
+    if os.path.isfile(url) or url.endswith('.json'):
+        if os.path.exists(url):
+            return True, None
+        return False, f"File not found: {url}"
+
     parsed = urlparse(url)
 
     if 'facebook.com' not in parsed.netloc:
-        return False, "URL must be a Facebook URL"
+        return False, "URL must be a Facebook URL or saved URLs JSON file"
 
     # Check for album indicators
     if 'media/set' in url or 'set=' in url or '/album' in url or '/photos' in url:
@@ -795,12 +1317,17 @@ def validate_url(url):
 def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=False,
                 login=False, cookie_file=DEFAULT_COOKIE_FILE, save_cookies_flag=True,
                 max_scrolls=DEFAULT_MAX_SCROLLS, scroll_delay=SCROLL_PAUSE_TIME,
-                page_timeout=DEFAULT_PAGE_TIMEOUT):
+                page_timeout=DEFAULT_PAGE_TIMEOUT, urls_file=None,
+                resume=True, urls_only=False):
     """
-    Main scraping function with authentication and improved error handling.
+    Main scraping function with authentication, resumable URL extraction, and disk detection.
     """
     resolved_cookie_file = resolve_cookie_path(cookie_file)
     has_cookie_file = resolved_cookie_file is not None and os.path.exists(resolved_cookie_file)
+
+    # If urls_file was specified without album_url, use it directly
+    if not album_url and urls_file:
+        album_url = urls_file
 
     # Interactive login requires a visible browser window only if no valid cookies exist
     if login and not has_cookie_file and headless:
@@ -828,16 +1355,87 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
                     print("Closing browser...")
                     driver.quit()
         else:
-            print("Error: No album URL provided.")
+            print("Error: No album URL or URLs file provided.")
             return False
 
-    # Validate URL
+    # Validate URL or input file
     is_valid, message = validate_url(album_url)
     if not is_valid:
         print(f"Error: {message}")
         return False
     if message:
         print(message)
+
+    # Direct resume from saved JSON manifest file without requiring browser
+    if album_url and (os.path.isfile(album_url) or album_url.endswith('.json')):
+        print(f"\nResuming album from saved URLs manifest: {album_url}")
+        print("-" * 50)
+        saved_manifest = load_saved_urls(album_url)
+        if not saved_manifest or not saved_manifest.get("photos"):
+            print(f"Error: Could not load photo URLs from {album_url}")
+            return False
+
+        album_title = saved_manifest.get("album_title") or "Facebook_Album"
+        manifest_album_url = saved_manifest.get("album_url", "")
+        manifest_dir = os.path.dirname(os.path.abspath(album_url))
+        output_path = manifest_dir if (manifest_dir and os.path.basename(manifest_dir) != "") else create_folder(output_folder, album_title)
+
+        photos = saved_manifest["photos"]
+        print(f"Album: {album_title}")
+        print(f"Output folder: {output_path}")
+        print(f"Loaded {len(photos)} photo(s) from manifest.")
+
+        if urls_only:
+            print(f"URLs already saved in manifest ({len(photos)} photos). Exiting (--urls-only).")
+            return True
+
+        # Check if all images are already downloaded on disk
+        if resume:
+            downloaded_on_disk, pending = detect_downloaded_images(photos, output_path)
+            if pending == 0 and downloaded_on_disk == len(photos):
+                print(f"\n[+] All {len(photos)} images are already downloaded on disk in {output_path}!")
+                return True
+
+        # Check if any photos need direct URLs
+        missing_direct = [p for p in photos if not p.get("direct_url")]
+        driver = None
+        if missing_direct:
+            print(f"\n[!] {len(missing_direct)} photo(s) are missing direct URLs. Launching browser to extract...")
+            driver = create_driver(headless=headless, page_load_timeout=page_timeout)
+            if save_cookies_flag and has_cookie_file:
+                load_cookies(driver, resolved_cookie_file)
+            for p in missing_direct:
+                if p.get("facebook_url"):
+                    d_url = extract_high_res_image(driver, p["facebook_url"], timeout=PAGE_LOAD_TIMEOUT)
+                    if d_url:
+                        p["direct_url"] = d_url
+                        save_urls_manifest(album_url, manifest_album_url, album_title, photos)
+
+        try:
+            cookies = driver.get_cookies() if driver else None
+            successful, failed = download_images_parallel(
+                photos,
+                output_path,
+                cookies=cookies,
+                driver=driver,
+                manifest_path=album_url,
+                album_url=manifest_album_url,
+                album_title=album_title,
+                resume=resume
+            )
+            return successful > 0
+        finally:
+            if driver:
+                print("Closing browser...")
+                driver.quit()
+
+    # Pre-scrape disk detection: check if existing manifest exists in output folder
+    existing_dir, existing_manifest_path, existing_data = (None, None, None)
+    if resume and not urls_file:
+        existing_dir, existing_manifest_path, existing_data = find_existing_manifest(output_folder, album_url=album_url)
+        if existing_dir and existing_data:
+            print(f"[+] Detected existing album download on disk: {existing_dir}")
+            print(f"    Loaded {len(existing_data.get('photos', []))} URLs from existing manifest.")
 
     print(f"\nStarting Facebook Album Downloader")
     print(f"Album URL: {album_url}")
@@ -909,6 +1507,20 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
         album_title = sanitize_filename(album_title)
         print(f"Album title: {album_title}")
 
+        # Resolve output path and manifest path early
+        output_path = create_folder(output_folder, album_title)
+        manifest_path = get_manifest_path(output_path, urls_file)
+
+        # Check for saved URLs on disk
+        saved_manifest = None
+        if resume:
+            saved_manifest = load_saved_urls(manifest_path)
+            if not saved_manifest and existing_manifest_path:
+                saved_manifest = existing_data
+                manifest_path = existing_manifest_path
+            if saved_manifest:
+                print(f"[+] Using saved URLs manifest: {manifest_path} ({len(saved_manifest.get('photos', []))} photos loaded)")
+
         # Scroll to load all photos and collect links progressively
         photo_links = scroll_and_collect_photos(
             driver,
@@ -917,39 +1529,69 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
         )
         print(f"Total photo links detected: {len(photo_links)}")
 
-        if not photo_links:
+        if not photo_links and not (saved_manifest and saved_manifest.get("photos")):
             print("No photos found. The page structure may have changed or the album may be private/inaccessible.")
             return False
 
-        # Extract high-resolution image URLs
-        print("\nExtracting high-resolution image URLs...")
-        img_urls = []
-        for i, photo_link in enumerate(photo_links):
-            print(f"  Processing photo {i + 1}/{len(photo_links)}...", end='\r')
-            img_url = extract_high_res_image(driver, photo_link, timeout=PAGE_LOAD_TIMEOUT)
-            if img_url:
-                img_urls.append(img_url)
+        # Merge newly collected links with saved manifest records
+        saved_photos = saved_manifest.get("photos", []) if (saved_manifest and resume) else []
+        photos = sync_photos_with_manifest(photo_links, saved_photos)
 
-        print(f"\nExtracted {len(img_urls)} of {len(photo_links)} image URLs")
+        # Check existing direct URLs
+        cached_count = sum(1 for p in photos if p.get("direct_url"))
+        to_extract = [p for p in photos if not p.get("direct_url")]
 
-        if not img_urls:
-            print("No image URLs could be extracted.")
+        if cached_count > 0:
+            print(f"\n[+] Detected {cached_count} cached image URL(s) on disk. {len(to_extract)} to extract.")
+
+        # Extract high-resolution image URLs for any photos missing direct URLs
+        if to_extract:
+            print(f"\nExtracting high-resolution image URLs ({len(to_extract)} photos)...")
+            extracted_new = 0
+            for i, p in enumerate(to_extract):
+                print(f"  Processing photo {i + 1}/{len(to_extract)} (total photo #{p['index']})...", end='\r')
+                img_url = extract_high_res_image(driver, p["facebook_url"], timeout=PAGE_LOAD_TIMEOUT)
+                if img_url:
+                    p["direct_url"] = img_url
+                    p["extracted_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    extracted_new += 1
+                    # Progressively save manifest to disk so progress is never lost
+                    save_urls_manifest(manifest_path, album_url, album_title, photos)
+            print(f"\nExtracted {extracted_new} new image URLs ({cached_count + extracted_new} total available)")
+        else:
+            print("\n[+] All photo URLs already extracted and saved on disk. Skipping extraction!")
+
+        # Save manifest after extraction phase
+        save_urls_manifest(manifest_path, album_url, album_title, photos)
+
+        available_urls = [p for p in photos if p.get("direct_url")]
+        if not available_urls:
+            print("No image URLs could be extracted or loaded from disk.")
             return False
 
-        # Create output folder
-        output_path = create_folder(output_folder, album_title)
+        if urls_only:
+            print(f"\n[+] URLs successfully saved to: {manifest_path} (--urls-only specified, skipping download)")
+            return True
 
-        # Download images in parallel with authenticated session cookies
+        # Download images in parallel with authenticated session cookies and resume detection
         successful, failed = download_images_parallel(
-            img_urls,
+            photos,
             output_path,
-            cookies=driver.get_cookies()
+            cookies=driver.get_cookies(),
+            driver=driver,
+            manifest_path=manifest_path,
+            album_url=album_url,
+            album_title=album_title,
+            resume=resume
         )
 
         return successful > 0
 
     except KeyboardInterrupt:
-        print("\nDownload cancelled by user")
+        print("\nDownload cancelled by user.")
+        if 'manifest_path' in locals() and 'photos' in locals() and photos:
+            save_urls_manifest(manifest_path, album_url, album_title if 'album_title' in locals() else "", photos)
+            print(f"Current progress saved to {manifest_path}")
         return False
 
     except Exception as e:
@@ -974,7 +1616,7 @@ def main():
     parser.add_argument(
         'album_url',
         nargs='?',
-        help='URL of the Facebook album to download'
+        help='URL of the Facebook album or path to a saved URLs JSON file'
     )
 
     parser.add_argument(
@@ -1009,6 +1651,24 @@ def main():
     )
 
     parser.add_argument(
+        '--urls-file',
+        default=None,
+        help=f'File path to save/load extracted photo URLs (defaults to {DEFAULT_URLS_FILENAME} inside album folder)'
+    )
+
+    parser.add_argument(
+        '--no-resume',
+        action='store_true',
+        help='Do not resume; re-extract all image URLs and re-download existing files'
+    )
+
+    parser.add_argument(
+        '--urls-only',
+        action='store_true',
+        help='Only extract and save image URLs to disk without downloading image files'
+    )
+
+    parser.add_argument(
         '--max-scrolls',
         type=int,
         default=DEFAULT_MAX_SCROLLS,
@@ -1032,18 +1692,20 @@ def main():
 
     args = parser.parse_args()
 
-    # If no URL provided, prompt for it or handle login-only
+    # If no URL provided, prompt for it or handle login-only or urls-file
     if not args.album_url:
-        if args.login:
+        if args.urls_file:
+            args.album_url = args.urls_file
+        elif args.login:
             print("Facebook Album Downloader - Authentication Mode")
             print("-" * 50)
-            url_choice = input("Enter the Facebook album URL (or press Enter to only log in and save session): ").strip()
+            url_choice = input("Enter the Facebook album URL or saved URLs file (or press Enter to only log in and save session): ").strip()
             if url_choice:
                 args.album_url = url_choice
         else:
             print("Facebook Album Downloader")
             print("-" * 30)
-            args.album_url = input("Enter the Facebook album URL: ").strip()
+            args.album_url = input("Enter the Facebook album URL or saved URLs file: ").strip()
 
             if not args.album_url:
                 print("Error: No URL provided")
@@ -1059,18 +1721,25 @@ def main():
         save_cookies_flag=not args.no_cookies,
         max_scrolls=args.max_scrolls,
         scroll_delay=args.scroll_delay,
-        page_timeout=args.page_timeout
+        page_timeout=args.page_timeout,
+        urls_file=args.urls_file,
+        resume=not args.no_resume,
+        urls_only=args.urls_only
     )
 
     if success:
         if not args.album_url and args.login:
             print("\n[+] Authentication completed and session saved successfully!")
+        elif args.urls_only:
+            print("\n[+] URLs extraction completed successfully!")
         else:
             print("\n[+] Album download completed successfully!")
         sys.exit(0)
     else:
         if not args.album_url and args.login:
             print("\n[-] Authentication failed or incomplete")
+        elif args.urls_only:
+            print("\n[-] URLs extraction failed or incomplete")
         else:
             print("\n[-] Album download failed or incomplete")
         sys.exit(1)
@@ -1078,4 +1747,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
