@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.firefox.options import Options
@@ -41,12 +41,28 @@ DEFAULT_COOKIE_FILE = "facebook_cookies.json"
 MAX_WORKERS = 5  # Number of concurrent downloads
 SCROLL_PAUSE_TIME = 2.0
 DEFAULT_MAX_SCROLLS = 300
+DEFAULT_PAGE_TIMEOUT = 30
 PAGE_LOAD_TIMEOUT = 10
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
 LOGIN_TIMEOUT = 300  # Max wait time for interactive login (5 minutes)
 MIN_ALBUM_TITLE_LENGTH = 10
 MAX_ALBUM_TITLE_LENGTH = 100
+
+
+def safe_get(driver, url):
+    """
+    Navigate to a URL using the driver, handling page load timeouts gracefully.
+    If navigation times out (common on Facebook due to long-polling / telemetry / media prefetch),
+    stops page loading via window.stop() so subsequent DOM inspection can continue.
+    """
+    try:
+        driver.get(url)
+    except TimeoutException:
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
 
 
 def resolve_cookie_path(cookie_path=DEFAULT_COOKIE_FILE):
@@ -129,7 +145,7 @@ def load_cookies(driver, cookie_path=DEFAULT_COOKIE_FILE):
 
         # Step 1: Open facebook.com first before trying to insert cookies
         print(f"Opening facebook.com before inserting cookies from {os.path.basename(resolved_path)}...")
-        driver.get("https://www.facebook.com")
+        safe_get(driver, "https://www.facebook.com")
         time.sleep(2)
 
         # Step 2: Delete guest cookies assigned on initial load to avoid collision
@@ -175,7 +191,7 @@ def load_cookies(driver, cookie_path=DEFAULT_COOKIE_FILE):
 
         # Step 4: Reload facebook.com to activate authenticated session
         print("Reloading facebook.com to activate session...")
-        driver.get("https://www.facebook.com")
+        safe_get(driver, "https://www.facebook.com")
         time.sleep(2)
 
         # Step 5: Check if authenticated
@@ -213,7 +229,7 @@ def wait_for_login(driver, timeout=LOGIN_TIMEOUT):
     print("=" * 60 + "\n")
 
     try:
-        driver.get(login_url)
+        safe_get(driver, login_url)
     except Exception as e:
         print(f"Error navigating to login page: {e}")
         return False
@@ -573,86 +589,102 @@ def is_avatar_url(url):
     return False
 
 
-def extract_high_res_image(driver, photo_url):
+def extract_high_res_image(driver, photo_url, timeout=PAGE_LOAD_TIMEOUT, retries=1):
     """
     Navigate to a photo page and extract the high-resolution image URL.
     Uses multiple strategies to find the real album image and avoid profile avatars.
+    Handles navigation timeouts gracefully by stopping page load and inspecting
+    the DOM that was already loaded.
     """
-    try:
-        driver.get(photo_url)
-
-        # Wait for the photo viewer element to appear
+    for attempt in range(retries + 1):
         try:
-            WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
-                EC.presence_of_element_located((
-                    By.CSS_SELECTOR,
-                    "img[data-visualcompletion='media-vc-image'], div[role='dialog'] img, div[data-pagelet='MediaViewerRoot'] img"
-                ))
-            )
-        except Exception:
-            time.sleep(2)
+            safe_get(driver, photo_url)
 
-        # Strategy 1: Check specifically for Facebook's media viewer image
-        # Facebook tags the main full-screen photo with data-visualcompletion="media-vc-image"
-        main_img = driver.find_elements(By.CSS_SELECTOR, "img[data-visualcompletion='media-vc-image']")
-        if main_img:
-            src = main_img[0].get_attribute("src")
-            if src and "scontent" in src:
-                return src
+            # Wait for the photo viewer element to appear
+            try:
+                WebDriverWait(driver, timeout).until(
+                    EC.presence_of_element_located((
+                        By.CSS_SELECTOR,
+                        "img[data-visualcompletion='media-vc-image'], div[role='dialog'] img, div[data-pagelet='MediaViewerRoot'] img, div[role='main'] img"
+                    ))
+                )
+            except Exception:
+                time.sleep(1.5)
 
-        # Strategy 2: Use JavaScript to find the largest image by natural dimensions
-        # Real album photos will have naturalWidth / naturalHeight > 300 (usually 1000-2048+),
-        # whereas avatars and icons are 100x100, 50x50, 40x40, etc.
-        js_find_largest = """
-            const imgs = Array.from(document.querySelectorAll('img'))
-                .filter(img => {
-                    if (!img.src || !img.src.includes('scontent')) return false;
-                    const s = img.src.toLowerCase();
-                    if (s.includes('-1/') || s.includes('_s100x100') || s.includes('_p100x100') ||
-                        s.includes('dst-jpg_s') || s.includes('dst-jpg_p')) {
-                        return false;
-                    }
-                    return img.naturalWidth > 300 && img.naturalHeight > 300;
-                });
-            if (imgs.length > 0) {
-                imgs.sort((a, b) => (b.naturalWidth * b.naturalHeight) - (a.naturalWidth * a.naturalHeight));
-                return imgs[0].src;
-            }
-            return null;
-        """
-        largest_src = driver.execute_script(js_find_largest)
-        if largest_src:
-            return largest_src
+            # Strategy 1: Check specifically for Facebook's media viewer image
+            # Facebook tags the main full-screen photo with data-visualcompletion="media-vc-image"
+            main_img = driver.find_elements(By.CSS_SELECTOR, "img[data-visualcompletion='media-vc-image']")
+            if main_img:
+                src = main_img[0].get_attribute("src")
+                if src and "scontent" in src:
+                    return src
 
-        # Strategy 3: Check dialog / media viewer container
-        dialog_imgs = driver.find_elements(By.CSS_SELECTOR, "div[role='dialog'] img, div[data-pagelet*='Media'] img")
-        for img in dialog_imgs:
-            src = img.get_attribute("src")
-            if src and "scontent" in src and not is_avatar_url(src):
-                return src
+            # Strategy 2: Use JavaScript to find the largest image by natural dimensions
+            # Real album photos will have naturalWidth / naturalHeight > 300 (usually 1000-2048+),
+            # whereas avatars and icons are 100x100, 50x50, 40x40, etc.
+            js_find_largest = """
+                const imgs = Array.from(document.querySelectorAll('img'))
+                    .filter(img => {
+                        if (!img.src || !img.src.includes('scontent')) return false;
+                        const s = img.src.toLowerCase();
+                        if (s.includes('-1/') || s.includes('_s100x100') || s.includes('_p100x100') ||
+                            s.includes('dst-jpg_s') || s.includes('dst-jpg_p')) {
+                            return false;
+                        }
+                        const w = img.naturalWidth || img.width || 0;
+                        const h = img.naturalHeight || img.height || 0;
+                        return w > 300 && h > 300;
+                    });
+                if (imgs.length > 0) {
+                    imgs.sort((a, b) => {
+                        const areaA = (a.naturalWidth || a.width || 0) * (a.naturalHeight || a.height || 0);
+                        const areaB = (b.naturalWidth || b.width || 0) * (b.naturalHeight || b.height || 0);
+                        return areaB - areaA;
+                    });
+                    return imgs[0].src;
+                }
+                return null;
+            """
+            largest_src = driver.execute_script(js_find_largest)
+            if largest_src:
+                return largest_src
 
-        # Strategy 4: Fallback BeautifulSoup parsing with strict avatar filtering
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        candidate_images = []
-        for img in soup.find_all('img'):
-            src = img.get('src', '')
-            if not src or 'scontent' not in src or 'emoji' in src.lower():
+            # Strategy 3: Check dialog / media viewer container
+            dialog_imgs = driver.find_elements(By.CSS_SELECTOR, "div[role='dialog'] img, div[data-pagelet*='Media'] img, div[role='main'] img")
+            for img in dialog_imgs:
+                src = img.get_attribute("src")
+                if src and "scontent" in src and not is_avatar_url(src):
+                    return src
+
+            # Strategy 4: Fallback BeautifulSoup parsing with strict avatar filtering
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+            candidate_images = []
+            for img in soup.find_all('img'):
+                src = img.get('src', '')
+                if not src or 'scontent' not in src or 'emoji' in src.lower():
+                    continue
+                if is_avatar_url(src):
+                    continue
+                candidate_images.append(src)
+
+            if candidate_images:
+                non_avatar = [u for u in candidate_images if '-1/' not in u]
+                if non_avatar:
+                    return non_avatar[0]
+                return candidate_images[0]
+
+            if attempt < retries:
+                time.sleep(1)
                 continue
-            if is_avatar_url(src):
+
+            return None
+
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(1)
                 continue
-            candidate_images.append(src)
-
-        if candidate_images:
-            non_avatar = [u for u in candidate_images if '-1/' not in u]
-            if non_avatar:
-                return non_avatar[0]
-            return candidate_images[0]
-
-        return None
-
-    except Exception as e:
-        print(f"  Error extracting image from {photo_url}: {str(e)}")
-        return None
+            print(f"\n  Error extracting image from {photo_url}: {str(e)}")
+            return None
 
 
 def extract_album_title(soup, album_url=None):
@@ -717,9 +749,12 @@ def extract_album_title(soup, album_url=None):
     return "Facebook_Album"
 
 
-def create_driver(headless=False):
+def create_driver(headless=False, page_load_timeout=DEFAULT_PAGE_TIMEOUT):
     """
     Create and configure a Firefox WebDriver.
+    Uses 'eager' page load strategy so navigation returns as soon as the DOM
+    is ready (DOMContentLoaded) rather than blocking indefinitely for background
+    media, tracking beacons, and long-polling connections to finish.
     """
     options = Options()
 
@@ -729,10 +764,11 @@ def create_driver(headless=False):
     # Additional options for stability
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.page_load_strategy = "eager"
 
     try:
         driver = webdriver.Firefox(options=options)
-        driver.set_page_load_timeout(30)
+        driver.set_page_load_timeout(page_load_timeout)
         return driver
     except Exception as e:
         print(f"Error creating Firefox driver: {e}")
@@ -758,7 +794,8 @@ def validate_url(url):
 
 def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=False,
                 login=False, cookie_file=DEFAULT_COOKIE_FILE, save_cookies_flag=True,
-                max_scrolls=DEFAULT_MAX_SCROLLS, scroll_delay=SCROLL_PAUSE_TIME):
+                max_scrolls=DEFAULT_MAX_SCROLLS, scroll_delay=SCROLL_PAUSE_TIME,
+                page_timeout=DEFAULT_PAGE_TIMEOUT):
     """
     Main scraping function with authentication and improved error handling.
     """
@@ -777,7 +814,7 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
             print("-" * 50)
             driver = None
             try:
-                driver = create_driver(headless=False)
+                driver = create_driver(headless=False, page_load_timeout=page_timeout)
                 if wait_for_login(driver):
                     if save_cookies_flag:
                         save_cookies(driver, cookie_file)
@@ -815,7 +852,7 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
     try:
         # Create browser driver
         print("Launching browser...")
-        driver = create_driver(headless=headless)
+        driver = create_driver(headless=headless, page_load_timeout=page_timeout)
 
         # Attempt to restore session from cookie file first
         session_active = False
@@ -831,7 +868,7 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
                 if headless:
                     print("Notice: Disabling headless mode for interactive authentication.")
                     driver.quit()
-                    driver = create_driver(headless=False)
+                    driver = create_driver(headless=False, page_load_timeout=page_timeout)
 
                 if not wait_for_login(driver):
                     print("Authentication failed or was cancelled.")
@@ -842,7 +879,7 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
 
         # Navigate to album
         print("Navigating to album page...")
-        driver.get(album_url)
+        safe_get(driver, album_url)
         time.sleep(3)  # Allow page to load
 
         # Check if Facebook redirected to login
@@ -863,7 +900,7 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
                 save_cookies(driver, cookie_file)
 
             print("\nRe-navigating to album page...")
-            driver.get(album_url)
+            safe_get(driver, album_url)
             time.sleep(3)
 
         # Parse initial page and extract album title
@@ -889,11 +926,11 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
         img_urls = []
         for i, photo_link in enumerate(photo_links):
             print(f"  Processing photo {i + 1}/{len(photo_links)}...", end='\r')
-            img_url = extract_high_res_image(driver, photo_link)
+            img_url = extract_high_res_image(driver, photo_link, timeout=PAGE_LOAD_TIMEOUT)
             if img_url:
                 img_urls.append(img_url)
 
-        print(f"\nExtracted {len(img_urls)} image URLs")
+        print(f"\nExtracted {len(img_urls)} of {len(photo_links)} image URLs")
 
         if not img_urls:
             print("No image URLs could be extracted.")
@@ -985,6 +1022,14 @@ def main():
         help=f'Delay in seconds between scroll actions (default: {SCROLL_PAUSE_TIME})'
     )
 
+    parser.add_argument(
+        '--page-timeout', '--timeout',
+        type=int,
+        default=DEFAULT_PAGE_TIMEOUT,
+        dest='page_timeout',
+        help=f'Page load timeout in seconds before aborting slow background requests (default: {DEFAULT_PAGE_TIMEOUT})'
+    )
+
     args = parser.parse_args()
 
     # If no URL provided, prompt for it or handle login-only
@@ -1013,7 +1058,8 @@ def main():
         cookie_file=args.cookies,
         save_cookies_flag=not args.no_cookies,
         max_scrolls=args.max_scrolls,
-        scroll_delay=args.scroll_delay
+        scroll_delay=args.scroll_delay,
+        page_timeout=args.page_timeout
     )
 
     if success:

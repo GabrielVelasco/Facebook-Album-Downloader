@@ -109,6 +109,9 @@ python albumDownloader.py
 | `--login`, `--auth` | Open Facebook login page in browser and wait for authentication |
 | `--cookies` | Path to save/load Facebook session cookies (default: `facebook_cookies.json`) |
 | `--no-cookies` | Disable loading or saving session cookies to disk |
+| `--max-scrolls` | Maximum scroll attempts for loading photos (default: `300`) |
+| `--scroll-delay` | Delay in seconds between scroll actions (default: `2.0`) |
+| `--page-timeout`, `--timeout` | Page load timeout in seconds before proceeding (default: `30`) |
 
 ## Limitations
 
