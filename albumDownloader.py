@@ -27,7 +27,13 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    InvalidSessionIdException,
+    NoSuchWindowException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.firefox.options import Options
@@ -50,7 +56,152 @@ REQUEST_TIMEOUT = 30
 LOGIN_TIMEOUT = 300  # Max wait time for interactive login (5 minutes)
 MIN_ALBUM_TITLE_LENGTH = 10
 MAX_ALBUM_TITLE_LENGTH = 100
+RECYCLE_BATCH_SIZE = 40  # Proactively recycle browser session every 40 photos to prevent memory leak and actor desync
 
+
+def is_fatal_driver_error(exc):
+    """
+    Check whether an exception indicates the WebDriver session has crashed,
+    desynchronized, or has an invalid/inactive Marionette actor.
+    """
+    if not exc:
+        return False
+    msg = str(exc).lower()
+    fatal_patterns = [
+        "inactiveactor",
+        "actor is no longer active",
+        "nosuchwindow",
+        "no such window",
+        "invalidsessionid",
+        "invalid session id",
+        "failed to decode response from marionette",
+        "connection refused",
+        "broken pipe",
+        "connection reset",
+        "max retries exceeded with url",
+        "target window already closed",
+        "not connected to devtools",
+        "disconnected",
+    ]
+    if isinstance(exc, (NoSuchWindowException, InvalidSessionIdException)):
+        return True
+    return any(pattern in msg for pattern in fatal_patterns)
+
+
+def heal_driver(driver):
+    """
+    Attempt lightweight in-place recovery of a desynchronized driver session:
+    - Discard any subframe / iframe context and return to top-level document
+    - Re-select the primary window handle
+    - Check responsiveness with a trivial script execution
+    Returns True if healed, False if recovery failed.
+    """
+    if not driver:
+        return False
+    try:
+        driver.switch_to.default_content()
+        handles = driver.window_handles
+        if not handles:
+            return False
+        current = None
+        try:
+            current = driver.current_window_handle
+        except Exception:
+            pass
+        if not current or current not in handles:
+            driver.switch_to.window(handles[0])
+        driver.execute_script("return 1;")
+        return True
+    except Exception:
+        return False
+
+
+class BrowserSession:
+    """
+    Manages the lifecycle of a Selenium browser instance:
+    - Creation and configuration with memory optimizations
+    - Cookie restoration
+    - In-place session healing
+    - Automatic restart/recovery upon fatal errors (e.g. InactiveActor)
+    - Proactive recycling during bulk extractions to prevent memory exhaustion
+    """
+    def __init__(self, headless=False, page_timeout=DEFAULT_PAGE_TIMEOUT,
+                 cookie_file=DEFAULT_COOKIE_FILE, save_cookies_flag=True,
+                 recycle_interval=RECYCLE_BATCH_SIZE):
+        self.headless = headless
+        self.page_timeout = page_timeout
+        self.cookie_file = cookie_file
+        self.save_cookies_flag = save_cookies_flag
+        self.recycle_interval = recycle_interval
+        self.driver = None
+        self.photos_since_restart = 0
+
+    def start(self):
+        """Launch a new browser and restore cookies if available."""
+        if self.driver is not None:
+            self.quit()
+        self.driver = create_driver(headless=self.headless, page_load_timeout=self.page_timeout)
+        if self.save_cookies_flag and self.cookie_file:
+            resolved = resolve_cookie_path(self.cookie_file)
+            if resolved:
+                load_cookies(self.driver, resolved)
+        self.photos_since_restart = 0
+        return self.driver
+
+    def get_driver(self):
+        """Get the active driver, starting a new one if not running."""
+        if self.driver is None:
+            return self.start()
+        return self.driver
+
+    def restart(self, reason=None):
+        """Cleanly close existing driver and start a fresh session."""
+        if reason:
+            print(f"\n[!] {reason}. Restarting browser session...")
+        else:
+            print("\n[!] Restarting browser session...")
+        self.quit()
+        return self.start()
+
+    def check_and_recycle(self):
+        """
+        Increment extraction counter and proactively recycle if interval reached.
+        Returns the active driver.
+        """
+        self.photos_since_restart += 1
+        if self.recycle_interval and self.photos_since_restart >= self.recycle_interval:
+            print(f"\n[+] Proactively recycling browser after {self.photos_since_restart} photos to free memory...")
+            return self.restart("Scheduled session refresh")
+        return self.get_driver()
+
+    def recover(self, exc=None):
+        """
+        Recover from a driver error. First tries in-place healing;
+        if that fails, restarts the browser cleanly and restores cookies.
+        Returns the active, healthy driver.
+        """
+        if self.driver is not None:
+            if heal_driver(self.driver):
+                return self.driver
+
+        err_str = str(exc).splitlines()[0] if exc else "Session error"
+        return self.restart(f"Browser recovered from: {err_str[:70]}")
+
+    def quit(self):
+        """Safely shut down the browser."""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.quit()
 
 
 def safe_get(driver, url):
@@ -58,14 +209,25 @@ def safe_get(driver, url):
     Navigate to a URL using the driver, handling page load timeouts gracefully.
     If navigation times out (common on Facebook due to long-polling / telemetry / media prefetch),
     stops page loading via window.stop() so subsequent DOM inspection can continue.
+    Propagates fatal driver errors (like InactiveActor or disconnected session) for recovery.
     """
     try:
         driver.get(url)
     except TimeoutException:
         try:
             driver.execute_script("window.stop();")
+        except Exception as stop_exc:
+            if is_fatal_driver_error(stop_exc):
+                raise stop_exc
+    except Exception as e:
+        if is_fatal_driver_error(e):
+            raise
+        try:
+            driver.execute_script("window.stop();")
         except Exception:
             pass
+    # Brief settling delay to allow Facebook router / DOM to stabilize
+    time.sleep(0.5)
 
 
 def resolve_cookie_path(cookie_path=DEFAULT_COOKIE_FILE):
@@ -801,7 +963,7 @@ def download_single_image(args):
 
 def download_images_parallel(photo_items, output_path, cookies=None, driver=None,
                              manifest_path=None, album_url=None, album_title=None,
-                             resume=True):
+                             resume=True, browser_session=None):
     """
     Download all images in parallel using ThreadPoolExecutor.
     Supports resuming by detecting already downloaded files on disk.
@@ -893,19 +1055,21 @@ def download_images_parallel(photo_items, output_path, cookies=None, driver=None
                 print(f"[{successful + failed}/{total}] {message}")
             else:
                 # Check if failure was due to expired/inaccessible CDN URL
-                if ("HTTP 403" in message or "HTTP 410" in message or "expired" in message.lower()) and photos[idx].get("facebook_url") and driver:
+                active_browser = browser_session or driver
+                if ("HTTP 403" in message or "HTTP 410" in message or "expired" in message.lower()) and photos[idx].get("facebook_url") and active_browser:
                     expired_items.append((idx, photos[idx]))
                 else:
                     failed += 1
                     print(f"[{successful + failed}/{total}] {message}")
 
-    # Handle expired URLs if driver is available
-    if expired_items and driver:
+    # Handle expired URLs if driver or session is available
+    active_browser = browser_session or driver
+    if expired_items and active_browser:
         print(f"\n[!] Refreshing {len(expired_items)} expired direct URL(s) via browser...")
         for idx, p in expired_items:
             fb_url = p.get("facebook_url")
             print(f"  Refreshing URL for image {idx + 1} ({fb_url})...")
-            fresh_url = extract_high_res_image(driver, fb_url, timeout=PAGE_LOAD_TIMEOUT)
+            fresh_url = extract_high_res_image(active_browser, fb_url, timeout=PAGE_LOAD_TIMEOUT)
             if fresh_url:
                 p["direct_url"] = fresh_url
                 print(f"  [+] Refreshed image {idx + 1}. Retrying download...")
@@ -1102,13 +1266,18 @@ def is_avatar_url(url):
     return False
 
 
-def extract_high_res_image(driver, photo_url, timeout=PAGE_LOAD_TIMEOUT, retries=1):
+def extract_high_res_image(driver_or_session, photo_url, timeout=PAGE_LOAD_TIMEOUT, retries=1):
     """
     Navigate to a photo page and extract the high-resolution image URL.
     Uses multiple strategies to find the real album image and avoid profile avatars.
     Handles navigation timeouts gracefully by stopping page load and inspecting
     the DOM that was already loaded.
+    Detects fatal driver errors (like InactiveActor: Actor is no longer active) and
+    automatically heals or restarts the browser session before retrying.
     """
+    session = driver_or_session if isinstance(driver_or_session, BrowserSession) else None
+    driver = session.get_driver() if session else driver_or_session
+
     for attempt in range(retries + 1):
         try:
             safe_get(driver, photo_url)
@@ -1193,6 +1362,20 @@ def extract_high_res_image(driver, photo_url, timeout=PAGE_LOAD_TIMEOUT, retries
             return None
 
         except Exception as e:
+            if is_fatal_driver_error(e):
+                err_line = str(e).splitlines()[0] if str(e) else "Fatal driver error"
+                if session:
+                    print(f"\n[!] Browser session error ({err_line[:70]}). Initiating automatic recovery...")
+                    driver = session.recover(e)
+                    if attempt < retries:
+                        time.sleep(1)
+                        continue
+                else:
+                    if heal_driver(driver):
+                        if attempt < retries:
+                            time.sleep(1)
+                            continue
+
             if attempt < retries:
                 time.sleep(1)
                 continue
@@ -1268,6 +1451,7 @@ def create_driver(headless=False, page_load_timeout=DEFAULT_PAGE_TIMEOUT):
     Uses 'eager' page load strategy so navigation returns as soon as the DOM
     is ready (DOMContentLoaded) rather than blocking indefinitely for background
     media, tracking beacons, and long-polling connections to finish.
+    Applies memory and performance optimizations to prevent InactiveActor and memory leaks.
     """
     options = Options()
 
@@ -1278,6 +1462,17 @@ def create_driver(headless=False, page_load_timeout=DEFAULT_PAGE_TIMEOUT):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.page_load_strategy = "eager"
+
+    # Disable BFcache (fastback cache) so old photo pages aren't retained in RAM with dead actors
+    options.set_preference("browser.sessionhistory.max_total_viewers", 0)
+    options.set_preference("browser.sessionhistory.max_entries", 5)
+
+    # Disable media / video autoplay to prevent background decoding during photo browsing
+    options.set_preference("media.autoplay.default", 5)
+    options.set_preference("media.autoplay.blocking_policy", 2)
+
+    # Multi-process limit to control memory usage
+    options.set_preference("dom.ipc.processCount", 4)
 
     try:
         driver = webdriver.Firefox(options=options)
@@ -1398,18 +1593,25 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
 
         # Check if any photos need direct URLs
         missing_direct = [p for p in photos if not p.get("direct_url")]
+        browser_session = None
         driver = None
         if missing_direct:
             print(f"\n[!] {len(missing_direct)} photo(s) are missing direct URLs. Launching browser to extract...")
-            driver = create_driver(headless=headless, page_load_timeout=page_timeout)
-            if save_cookies_flag and has_cookie_file:
-                load_cookies(driver, resolved_cookie_file)
+            browser_session = BrowserSession(
+                headless=headless,
+                page_timeout=page_timeout,
+                cookie_file=resolved_cookie_file if (save_cookies_flag and has_cookie_file) else None,
+                save_cookies_flag=save_cookies_flag
+            )
+            driver = browser_session.start()
             for p in missing_direct:
                 if p.get("facebook_url"):
-                    d_url = extract_high_res_image(driver, p["facebook_url"], timeout=PAGE_LOAD_TIMEOUT)
+                    d_url = extract_high_res_image(browser_session, p["facebook_url"], timeout=PAGE_LOAD_TIMEOUT)
                     if d_url:
                         p["direct_url"] = d_url
                         save_urls_manifest(album_url, manifest_album_url, album_title, photos)
+                browser_session.check_and_recycle()
+            driver = browser_session.get_driver()
 
         try:
             cookies = driver.get_cookies() if driver else None
@@ -1418,6 +1620,7 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
                 output_path,
                 cookies=cookies,
                 driver=driver,
+                browser_session=browser_session,
                 manifest_path=album_url,
                 album_url=manifest_album_url,
                 album_title=album_title,
@@ -1425,7 +1628,10 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
             )
             return successful > 0
         finally:
-            if driver:
+            if browser_session:
+                print("Closing browser...")
+                browser_session.quit()
+            elif driver:
                 print("Closing browser...")
                 driver.quit()
 
@@ -1446,17 +1652,21 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
         print("Authentication: Interactive login enabled")
     print("-" * 50)
 
+    browser_session = None
     driver = None
     try:
-        # Create browser driver
+        # Create browser driver session
         print("Launching browser...")
-        driver = create_driver(headless=headless, page_load_timeout=page_timeout)
+        browser_session = BrowserSession(
+            headless=headless,
+            page_timeout=page_timeout,
+            cookie_file=resolved_cookie_file if (save_cookies_flag and has_cookie_file) else None,
+            save_cookies_flag=save_cookies_flag
+        )
+        driver = browser_session.start()
 
-        # Attempt to restore session from cookie file first
-        session_active = False
-        if save_cookies_flag and has_cookie_file:
-            print(f"Restoring session from {os.path.basename(resolved_cookie_file)}...")
-            session_active = load_cookies(driver, resolved_cookie_file)
+        # Check authentication status
+        session_active = is_authenticated(driver)
 
         # If interactive login was explicitly requested
         if login:
@@ -1465,8 +1675,8 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
             else:
                 if headless:
                     print("Notice: Disabling headless mode for interactive authentication.")
-                    driver.quit()
-                    driver = create_driver(headless=False, page_load_timeout=page_timeout)
+                    browser_session.headless = False
+                    driver = browser_session.restart("Switching to headed mode for authentication")
 
                 if not wait_for_login(driver):
                     print("Authentication failed or was cancelled.")
@@ -1550,13 +1760,14 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
             extracted_new = 0
             for i, p in enumerate(to_extract):
                 print(f"  Processing photo {i + 1}/{len(to_extract)} (total photo #{p['index']})...", end='\r')
-                img_url = extract_high_res_image(driver, p["facebook_url"], timeout=PAGE_LOAD_TIMEOUT)
+                img_url = extract_high_res_image(browser_session, p["facebook_url"], timeout=PAGE_LOAD_TIMEOUT)
                 if img_url:
                     p["direct_url"] = img_url
                     p["extracted_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                     extracted_new += 1
                     # Progressively save manifest to disk so progress is never lost
                     save_urls_manifest(manifest_path, album_url, album_title, photos)
+                browser_session.check_and_recycle()
             print(f"\nExtracted {extracted_new} new image URLs ({cached_count + extracted_new} total available)")
         else:
             print("\n[+] All photo URLs already extracted and saved on disk. Skipping extraction!")
@@ -1573,12 +1784,14 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
             print(f"\n[+] URLs successfully saved to: {manifest_path} (--urls-only specified, skipping download)")
             return True
 
+        driver = browser_session.get_driver()
         # Download images in parallel with authenticated session cookies and resume detection
         successful, failed = download_images_parallel(
             photos,
             output_path,
-            cookies=driver.get_cookies(),
+            cookies=driver.get_cookies() if driver else None,
             driver=driver,
+            browser_session=browser_session,
             manifest_path=manifest_path,
             album_url=album_url,
             album_title=album_title,
@@ -1599,7 +1812,10 @@ def do_scraping(album_url=None, output_folder=DEFAULT_OUTPUT_FOLDER, headless=Fa
         return False
 
     finally:
-        if driver:
+        if browser_session:
+            print("\nClosing browser...")
+            browser_session.quit()
+        elif driver:
             print("\nClosing browser...")
             driver.quit()
 

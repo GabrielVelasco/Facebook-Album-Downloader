@@ -17,6 +17,8 @@ A Python script to download Facebook albums even if you're not the album's owner
 - **Progress tracking** - Shows real-time download progress
 - **Headless mode** - Optional mode to run without visible browser window
 - **Robust scraping** - Uses multiple strategies to find images, more resilient to Facebook UI changes
+- **Self-healing session & auto-recovery** - Automatically recovers from browser desynchronization or crashes (`InactiveActor`), reloads cookies, and retries without failing the album
+- **Proactive memory management** - Automatically recycles the browser session during bulk extractions to prevent memory leaks on large albums
 - **Smart file naming** - Automatically detects image format (jpg, png, gif, webp)
 
 ## Prerequisites
